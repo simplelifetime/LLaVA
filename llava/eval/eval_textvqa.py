@@ -5,7 +5,6 @@ import re
 
 from llava.eval.m4c_evaluator import TextVQAAccuracyEvaluator
 
-
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--annotation-file', type=str)
