@@ -12,6 +12,7 @@ def get_args():
     parser.add_argument('--result-file', type=str)
     parser.add_argument('--result-dir', type=str)
     parser.add_argument('--lemmatize', action='store_true')
+    parser.add_argument("--anskey", type=str, default="answer")
     return parser.parse_args()
 
 def read_vocab(file):
@@ -50,9 +51,14 @@ def eval_single(annotation_file, result_file, args):
     pred_list = []
     for idx, result in enumerate(results):
         annotation = annotations[idx]
+        gt_answers = annotation[args.anskey]
+        
+        if isinstance(gt_answers[0], dict):
+            gt_answers = [g['answer'] for g in gt_answers]
+            
         pred_list.append({
             "pred_answer": result['text'].lower(),
-            "gt_answers": annotation['answer'],
+            "gt_answers": gt_answers,
         })
 
     evaluator = TextVQAAccuracyEvaluator()

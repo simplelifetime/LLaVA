@@ -21,7 +21,7 @@ import json
 import logging
 import pathlib
 from typing import Dict, Optional, Sequence, List
-
+import numpy as np
 import torch
 
 import transformers
@@ -69,6 +69,10 @@ class DataArguments:
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
     image_grid_pinpoints: Optional[str] = field(default=None)
+    visual_noise: bool = False
+    textual_noise: bool = False
+    visual_noise_eps: float = 16.0
+    visual_noise_eps: float = 0.05
 
 
 @dataclass
@@ -675,6 +679,17 @@ class LazySupervisedDataset(Dataset):
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+
+            # visual noise
+            if self.data_args.visual_noise:
+                image_array = np.array(image)
+                mean = 0
+                std_dev = self.data_args.visual_noise_eps
+                noise = np.random.normal(mean, std_dev, image_array.shape)
+                noisy_image_array = image_array + noise
+                noisy_image_array = np.clip(noisy_image_array, 0, 255).astype(np.uint8)
+                image = Image.fromarray(noisy_image_array)
+
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -760,6 +775,21 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 eval_dataset=None,
                 data_collator=data_collator)
 
+def NEFTune(model, noise_alpha=0.05):
+    def noised_embed(orig_embed, noise_alpha):
+        def new_func(x):
+            if model.training:
+                embed_init = orig_embed(x)
+                dims = torch.tensor(embed_init.size(1))
+                mag_norm = noise_alpha/torch.sqrt(dims)
+                return embed_init + torch.zeros_like(embed_init).uniform_(-mag_norm, mag_norm)
+            else:
+                return orig_embed(x)
+        return new_func
+
+    model.model.base_model.embed_tokens.forward = noised_embed(model.model.base_model.embed_tokens.forward, noise_alpha)
+    return model
+
 
 def train():
     global local_rank
@@ -804,6 +834,8 @@ def train():
                 cache_dir=training_args.cache_dir,
                 **bnb_model_from_pretrained_args
             )
+            if data_args.textual_noise:
+                model = NEFTune(model)
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -845,6 +877,7 @@ def train():
                 model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(

@@ -1,10 +1,10 @@
 #!/bin/bash
 
-deepspeed --master_port 12345 --include localhost:0,1,2,3,4,5,6,7 llava/train/train.py \
+deepspeed --master_port 12346 --include localhost:4,5,6,7 llava/train/train_mem.py \
     --deepspeed ./scripts/zero3.json \
     --model_name_or_path /mnt/data/zkliu/hf_models/vicuna-7b-v1.5 \
     --version v1 \
-    --data_path data/llava_instruct_50k.json,data/vqa_okvqa.json \
+    --data_path data/vqa_data_v2.json,data/llava_instruct_150k_v3.json,data/aokvqa_data_v2.json,data/gqa_data_v2.json,data/ocr_data_v2.json \
     --image_folder /mnt/data/zkliu/llava_datasets \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --pretrain_mm_mlp_adapter /mnt/data/zkliu/hf_models/llava-v1.5-mlp2x-336px-pretrain-vicuna-7b-v1.5/mm_projector.bin \
@@ -14,7 +14,7 @@ deepspeed --master_port 12345 --include localhost:0,1,2,3,4,5,6,7 llava/train/tr
     --mm_use_im_patch_token False \
     --image_aspect_ratio pad \
     --bf16 True \
-    --output_dir /mnt/data/zkliu/llava_for_okvqa/llava_t2_v3 \
+    --output_dir /mnt/data/zkliu/llava_for_okvqa/llava_t5_v8 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 8 \
     --per_device_eval_batch_size 4 \
@@ -33,4 +33,4 @@ deepspeed --master_port 12345 --include localhost:0,1,2,3,4,5,6,7 llava/train/tr
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
-    --report_to "none"
+    --report_to "wandb"
