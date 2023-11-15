@@ -91,13 +91,18 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):
+    def encode_images(self, images, adv_noise):
+        if adv_noise:
+            batch_size = images.size(0)
+            images = images + adv_noise.repeat(batch_size, 1, 1, 1)
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
+
+    
     def prepare_inputs_labels_for_multimodal(
-        self, input_ids, attention_mask, past_key_values, labels, images
+        self, input_ids, attention_mask, past_key_values, labels, images, adv_noise_v, adv_noise_t
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -107,12 +112,12 @@ class LlavaMetaForCausalLM(ABC):
 
         if type(images) is list or images.ndim == 5:
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
+            image_features = self.encode_images(concat_images, adv_noise_v)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             image_features = [x.flatten(0, 1) for x in image_features]
         else:
-            image_features = self.encode_images(images)
+            image_features = self.encode_images(images, adv_noise_v)
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None
@@ -123,8 +128,8 @@ class LlavaMetaForCausalLM(ABC):
                 # FIXME: this is a hacky fix, for deepspeed zero3 to work
                 half_len = cur_input_ids.shape[0] // 2
                 cur_image_features = image_features[cur_image_idx]
-                cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids[:half_len])
-                cur_input_embeds_2 = self.get_model().embed_tokens(cur_input_ids[half_len:])
+                cur_input_embeds_1 = self.embed_tokens(cur_input_ids[:half_len], adv_noise_t)
+                cur_input_embeds_2 = self.embed_tokens(cur_input_ids[half_len:], adv_noise_t)
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0], cur_input_embeds_2], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 if labels is not None:
@@ -141,17 +146,17 @@ class LlavaMetaForCausalLM(ABC):
                 cur_image_features = image_features[cur_image_idx]
                 image_token_start = image_token_indices[0]
                 if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
-                    cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:image_token_start-1]).detach())
-                    cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[image_token_start-1:image_token_start]))
+                    cur_new_input_embeds.append(self.embed_tokens(cur_input_ids[:image_token_start-1], adv_noise_t).detach())
+                    cur_new_input_embeds.append(self.embed_tokens(cur_input_ids[image_token_start-1:image_token_start], adv_noise_t))
                     cur_new_input_embeds.append(cur_image_features)
-                    cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[image_token_start+1:image_token_start+2]))
+                    cur_new_input_embeds.append(self.embed_tokens(cur_input_ids[image_token_start+1:image_token_start+2], adv_noise_t))
                     if labels is not None:
                         cur_new_labels.append(cur_labels[:image_token_start])
                         cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
                         cur_new_labels.append(cur_labels[image_token_start:image_token_start+1])
                         cur_labels = cur_labels[image_token_start+2:]
                 else:
-                    cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:image_token_start]))
+                    cur_new_input_embeds.append(self.embed_tokens(cur_input_ids[:image_token_start], adv_noise_t))
                     cur_new_input_embeds.append(cur_image_features)
                     if labels is not None:
                         cur_new_labels.append(cur_labels[:image_token_start])
@@ -165,9 +170,9 @@ class LlavaMetaForCausalLM(ABC):
                 image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
             if cur_input_ids.numel() > 0:
                 if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
-                    cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids).detach())
+                    cur_new_input_embeds.append(self.embed_tokens(cur_input_ids, adv_noise_t).detach())
                 else:
-                    cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids))
+                    cur_new_input_embeds.append(self.embed_tokens(cur_input_ids, adv_noise_t))
                 if labels is not None:
                     cur_new_labels.append(cur_labels)
             cur_new_input_embeds = [x.to(device=self.device) for x in cur_new_input_embeds]
