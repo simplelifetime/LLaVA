@@ -47,13 +47,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # # init noise
-        # self.epsilon = 32 / 255
-        # self.adv_noise = torch.randn([3, 336, 336], dtype=self.model.dtype).cuda() * 2 * self.epsilon - self.epsilon
-        # self.adv_noise.requires_grad_(True)
-        # self.adv_noise.retain_grad()
-        
         # Initialize weights and apply final processing
+        self.hidden_size = torch.tensor(config.hidden_size)
+        
+        # should be changed into config
+        self.noise_training = True
+        self.pgd = 4
+        
         self.post_init()
 
     def get_model(self):
@@ -61,9 +61,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     
     def embed_tokens(self, x, adv_noise=None):
         embeds = self.get_model().embed_tokens(x)
-        if adv_noise:
-            batch_size = x.size(0)
-            embeds = embeds + adv_noise.repeat(batch_size, 1)
+        if adv_noise is not None:
+            embeds = embeds + adv_noise
         return embeds
 
     def forward(
@@ -77,9 +76,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
-        return_dict: Optional[bool] = None,
-        adv_noise_v: Optional[torch.Tensor] = None,
-        adv_noise_t: Optional[torch.Tensor] = None,
+        return_dict: Optional[bool] = None
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -87,7 +84,54 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images, adv_noise_v, adv_noise_t)
+        if self.noise_training:
+            # noise
+            batch_size = images.size(0)
+            dtype = images.dtype
+            mag_norm = 0.05 / torch.sqrt(self.hidden_size)
+            # textual noise
+            adv_txt = torch.zeros([batch_size, self.hidden_size], device=images.device, dtype=dtype).uniform_(-mag_norm, mag_norm)
+            adv_txt.required_grad = True
+            
+            # adv_img = torch.randn([batch_size, self.hidden_size], device=images.device)
+            # adv_img.requires_grad = True
+            
+            for _ in range(self.pgd):
+                input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images, adv_txt = adv_txt)
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict
+                )
+                hidden_states = outputs[0]
+                logits = self.lm_head(hidden_states)
+                loss = None
+                if labels is not None:
+                    # Shift so that tokens < n predict n
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    # Flatten the tokens
+                    loss_fct = CrossEntropyLoss()
+                    shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                    shift_labels = shift_labels.view(-1)
+                    # Enable model/pipeline parallelism
+                    shift_labels = shift_labels.to(shift_logits.device)
+                    loss = loss_fct(shift_logits, shift_labels)
+                    IPython.embed()
+                    noise_grad_txt = torch.autograd.grad(loss, adv_txt, retain_graph=True)[0]
+                    print(noise_grad_txt)
+                    adv_text = adv_text + (noise_grad_txt / torch.norm(noise_grad_txt, dim=-1, keepdim=True)).mul_(1e-3)
+                    adv_txt = torch.where(torch.isnan(adv_txt), torch.zeros_like(adv_txt), adv_txt)
+            
+            input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images, adv_txt = adv_txt)
+        
+        else:
+            input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(

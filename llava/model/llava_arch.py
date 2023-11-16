@@ -97,12 +97,11 @@ class LlavaMetaForCausalLM(ABC):
             images = images + adv_noise.repeat(batch_size, 1, 1, 1)
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
+        # image_features size : [batch_size, 576, 4096]
         return image_features
 
-
-    
     def prepare_inputs_labels_for_multimodal(
-        self, input_ids, attention_mask, past_key_values, labels, images, adv_noise_v, adv_noise_t
+        self, input_ids, attention_mask, past_key_values, labels, images, adv_img=None, adv_txt=None
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -112,17 +111,18 @@ class LlavaMetaForCausalLM(ABC):
 
         if type(images) is list or images.ndim == 5:
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images, adv_noise_v)
+            image_features = self.encode_images(concat_images, adv_img)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             image_features = [x.flatten(0, 1) for x in image_features]
         else:
-            image_features = self.encode_images(images, adv_noise_v)
+            image_features = self.encode_images(images, adv_img)
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
+            adv_noise_t = adv_txt[batch_idx]
             if (cur_input_ids == IMAGE_TOKEN_INDEX).sum() == 0:
                 # multimodal LLM, but the current sample is not multimodal
                 # FIXME: this is a hacky fix, for deepspeed zero3 to work
