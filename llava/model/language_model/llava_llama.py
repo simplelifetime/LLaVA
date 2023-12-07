@@ -23,7 +23,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, \
                          LlamaConfig, LlamaModel, LlamaForCausalLM
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
+import math
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 from transformers.trainer import get_parameter_names, ALL_LAYERNORM_LAYERS
     
@@ -51,8 +51,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.hidden_size = torch.tensor(config.hidden_size)
         
         # should be changed into config
-        self.noise_training = True
-        self.pgd = 4
+        self.noise_training = False
+        if self.noise_training:
+            print('Noise training activated')
+        self.pgd = 2
         
         self.post_init()
 
@@ -64,6 +66,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         if adv_noise is not None:
             embeds = embeds + adv_noise
         return embeds
+    
+    def init_noise_config(self, training_args):
+        self.noise_training = training_args.noise_training
+        self.pgd = training_args.pgd
 
     def forward(
         self,
@@ -88,21 +94,25 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             # noise
             batch_size = images.size(0)
             dtype = images.dtype
-            mag_norm = 0.05 / torch.sqrt(self.hidden_size)
-            # textual noise
-            adv_txt = torch.zeros([batch_size, self.hidden_size], device=images.device, dtype=dtype).uniform_(-mag_norm, mag_norm)
-            adv_txt.required_grad = True
+            mag_norm = 0.05 / math.sqrt(int(self.hidden_size))
             
+            # textual noise
+            # zeros are ok, uniform distribution may be better
+            adv_txt = torch.zeros([batch_size, self.hidden_size], device=images.device, dtype=dtype).uniform_(-mag_norm, mag_norm)
+            # adv_txt = torch.zeros([batch_size, self.hidden_size], device=images.device, dtype=dtype)
+            # adv_txt = torch.zeros([8, 4096], dtype=float, require_grad=True).uniform_(-0.05 / math.sqrt(4096), 0.05 / math.sqrt(4096))
+            # visual noise
             # adv_img = torch.randn([batch_size, self.hidden_size], device=images.device)
             # adv_img.requires_grad = True
             
             for _ in range(self.pgd):
-                input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images, adv_txt = adv_txt)
+                adv_txt.requires_grad_()
+                input_ids_t, attention_mask_t, past_key_values_t, inputs_embeds_t, labels_t = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images, adv_txt = adv_txt)
                 outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids_t,
+                    attention_mask=attention_mask_t,
+                    past_key_values=past_key_values_t,
+                    inputs_embeds=inputs_embeds_t,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
@@ -111,10 +121,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 hidden_states = outputs[0]
                 logits = self.lm_head(hidden_states)
                 loss = None
-                if labels is not None:
+                if labels_t is not None:
                     # Shift so that tokens < n predict n
                     shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
+                    shift_labels = labels_t[..., 1:].contiguous()
                     # Flatten the tokens
                     loss_fct = CrossEntropyLoss()
                     shift_logits = shift_logits.view(-1, self.config.vocab_size)
@@ -122,12 +132,24 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     # Enable model/pipeline parallelism
                     shift_labels = shift_labels.to(shift_logits.device)
                     loss = loss_fct(shift_logits, shift_labels)
-                    IPython.embed()
-                    noise_grad_txt = torch.autograd.grad(loss, adv_txt, retain_graph=True)[0]
-                    print(noise_grad_txt)
-                    adv_text = adv_text + (noise_grad_txt / torch.norm(noise_grad_txt, dim=-1, keepdim=True)).mul_(1e-3)
+                    # IPython.embed()
+                    # noise_grad_txt = torch.autograd.grad(loss, adv_txt, retain_graph=True)[0]
+                    # print(noise_grad_txt)
+                    loss.backward(retain_graph=True)
+                    noise_grad_txt = adv_txt.grad.clone().detach()
+                    
+                    # debugging
+                    # if images.device.index == 0:
+                    #     print(noise_grad_txt)
+                    #     print(torch.norm(noise_grad_txt, dim=-1, keepdim=True).mul_(1e-3))
+                        
+                    adv_txt = (adv_txt + (noise_grad_txt / torch.norm(noise_grad_txt, dim=-1, keepdim=True)).mul_(1e-2)).detach()
                     adv_txt = torch.where(torch.isnan(adv_txt), torch.zeros_like(adv_txt), adv_txt)
-            
+                    # adv_txt.retain_grad()
+                    
+            # if images.device.index == 0:
+            #     print(adv_txt)
+                
             input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images, adv_txt = adv_txt)
         
         else:
